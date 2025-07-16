@@ -4,12 +4,20 @@ import numpy as np
 import easyocr
 from ultralytics import YOLO
 from PIL import Image
+import io
 
-# Load the YOLOv8 model
-model = YOLO('models/yolov8n.pt') 
+# Load the specialized YOLOv8 model for license plate detection
+@st.cache_resource
+def load_yolo_model():
+    return YOLO('models/license_plate_detector.pt') 
 
 # Initialize EasyOCR reader
-reader = easyocr.Reader(['en'])
+@st.cache_resource
+def load_ocr_model():
+    return easyocr.Reader(['en'])
+
+model = load_yolo_model()
+ocr = load_ocr_model()
 
 def recognize_plate(img):
     """
@@ -19,53 +27,99 @@ def recognize_plate(img):
     results = model(img)
 
     plate_number = "No plate detected"
+    confidence = 0.0
     
     # Process results
     for r in results:
         boxes = r.boxes
         if boxes:
-            # Get the first detected box
-            box = boxes[0]
+            # Get the box with highest confidence
+            confidences = boxes.conf.cpu().numpy()
+            best_idx = np.argmax(confidences)
+            
+            box = boxes[best_idx]
             x1, y1, x2, y2 = map(int, box.xyxy[0])
+            confidence = float(box.conf[0])
             
-            # Crop the image to the detected license plate
-            cropped_img = img[y1:y2, x1:x2]
-            
-            # Use EasyOCR on the cropped image
-            ocr_result = reader.readtext(cropped_img)
-            
-            if ocr_result:
-                # Assuming the first detected text is the plate number
-                plate_number = ocr_result[0][1]
-                return plate_number
-
-    return None
-
+            # Only process if confidence is above threshold
+            if confidence > 0.3:
+                # Crop the image to the detected license plate
+                cropped_img = img[y1:y2, x1:x2]
+                
+                # Use EasyOCR on the cropped image
+                ocr_result = ocr.readtext(cropped_img)
+                
+                if ocr_result:
+                    # Extract text with highest confidence
+                    texts = []
+                    for detection in ocr_result:
+                        text = detection[1]
+                        ocr_conf = detection[2]
+                        if ocr_conf > 0.5:  # Filter low confidence OCR results
+                            texts.append(text)
+                    
+                    if texts:
+                        plate_number = " ".join(texts).upper()
+                        # Clean up the text (remove special characters, keep alphanumeric)
+                        plate_number = ''.join(c for c in plate_number if c.isalnum() or c.isspace()).strip()
+    
+    return plate_number, confidence
 
 st.set_page_config(page_title="Plate Number Recognition", layout="centered")
 
-st.title("License Plate Recognition App")
+st.title("🚗 License Plate Recognition App")
 
 st.markdown("""
-This app uses your phone's camera to recognize license plates.
-- Click the **'Take a picture'** button below.
-- Grant camera permissions if prompted.
-- Capture a clear image of the license plate.
+**Enhanced with YOLOv8 + EasyOCR for better accuracy!**
+
+- Click **'Take a picture'** to capture an image
+- Grant camera permissions if prompted  
+- The app will detect and read the license plate automatically
 """)
 
-picture = st.camera_input("Take a picture")
+# Camera input
+camera_input = st.camera_input("Take a picture of a license plate")
 
-if picture:
-    # To read image file buffer in OpenCV
-    bytes_data = picture.getvalue()
-    cv2_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
-
-    st.image(cv2_img, channels="BGR", caption="Your Picture", use_column_width=True)
+if camera_input is not None:
+    # Convert the image to OpenCV format
+    image = Image.open(camera_input)
+    img_array = np.array(image)
     
-    with st.spinner('Recognizing plate number...'):
-        plate = recognize_plate(cv2_img)
+    # Convert RGB to BGR for OpenCV
+    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+    
+    with st.spinner("🔍 Analyzing image for license plates..."):
+        plate_text, detection_confidence = recognize_plate(img_bgr)
+    
+    # Display the captured image
+    st.image(image, caption="Captured Image", use_container_width=True)
+    
+    if plate_text != "No plate detected":
+        st.success(f"✅ **License Plate Detected:** `{plate_text}`")
+        st.info(f"🎯 **Detection Confidence:** {detection_confidence:.2%}")
         
-        if plate:
-            st.success(f"Detected Plate Number: **{plate}**")
-        else:
-            st.error("Could not recognize the license plate. Please try again with a clearer picture.") 
+        # Display in a prominent way
+        st.markdown(f"""
+        <div style="
+            background-color: #f0f2f6; 
+            padding: 20px; 
+            border-radius: 10px; 
+            text-align: center;
+            border: 2px solid #4CAF50;
+            margin: 20px 0;
+        ">
+            <h2 style="color: #4CAF50; margin: 0;">🏁 {plate_text}</h2>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.warning("⚠️ No license plate detected. Try:")
+        st.markdown("""
+        - Ensure the plate is clearly visible
+        - Good lighting conditions
+        - Camera is stable and focused
+        - Plate is not too far or too close
+        """)
+
+# Footer
+st.markdown("---")
+st.markdown("*Powered by YOLOv8 for detection and EasyOCR for text recognition*") 
