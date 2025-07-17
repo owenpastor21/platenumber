@@ -3,4 +3,3 @@ openai
 opencv-python-headless
 ultralytics
 Pillow
-base64 
