@@ -7,10 +7,10 @@ from openai import OpenAI
 from ultralytics import YOLO
 from PIL import Image
 
-# Load the specialized YOLOv8 model for license plate detection
+# Load the YOLOv12 small model for general object detection
 @st.cache_resource
 def load_yolo_model():
-    return YOLO('models/license_plate_detector.pt') 
+    return YOLO('yolo12s.pt')  # YOLOv12 small model
 
 model = load_yolo_model()
 
@@ -124,54 +124,81 @@ License plate text:"""
 
 def recognize_plate(img):
     """
-    Recognize license plate from an image using YOLOv8 and GPT-4o vision.
+    Recognize license plate from an image using YOLOv12 and GPT-4o vision.
     """
     client = get_openai_client()
     
-    # Run YOLOv8 inference
+    # Run YOLOv12 inference to detect all objects
     results = model(img)
 
     plate_number = "No plate detected"
     confidence = 0.0
     cropped_img = None
+    use_full_image = False
     
-    # Process results
+    # Process results to find car-related objects that might contain license plates
     for r in results:
         boxes = r.boxes
         if boxes:
-            # Get the box with highest confidence
-            confidences = boxes.conf.cpu().numpy()
-            best_idx = np.argmax(confidences)
+            # Look for cars, trucks, buses, motorcycles, or any vehicle
+            # COCO class IDs: car=2, motorcycle=3, bus=5, truck=7
+            vehicle_classes = [2, 3, 5, 7]  # car, motorcycle, bus, truck
             
-            box = boxes[best_idx]
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            confidence = float(box.conf[0])
+            vehicle_found = False
             
-            # Only process if confidence is above threshold
-            if confidence > 0.3:
-                # Crop the image to the detected license plate
-                cropped_img = img[y1:y2, x1:x2]
+            for i, box in enumerate(boxes):
+                class_id = int(box.cls[0])
+                confidence_score = float(box.conf[0])
                 
-                # Add some padding to the cropped image for better analysis
-                height, width = cropped_img.shape[:2]
-                pad_height = int(height * 0.1)
-                pad_width = int(width * 0.1)
-                
-                # Create padded image
-                padded_img = cv2.copyMakeBorder(
-                    cropped_img, 
-                    pad_height, pad_height, pad_width, pad_width,
-                    cv2.BORDER_CONSTANT, 
-                    value=[255, 255, 255]  # White padding
-                )
-                
-                # Use GPT-4o to analyze the cropped plate
-                plate_text = analyze_plate_with_gpt4o(padded_img, client)
-                
+                # If we detect a vehicle with confidence higher than 50%
+                if class_id in vehicle_classes and confidence_score > 0.5:
+                    vehicle_found = True
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    confidence = confidence_score
+                    
+                    # Crop the vehicle area (license plate likely to be in this region)
+                    cropped_img = img[y1:y2, x1:x2]
+                    
+                    # Add some padding to the cropped image for better analysis
+                    height, width = cropped_img.shape[:2]
+                    pad_height = int(height * 0.1)
+                    pad_width = int(width * 0.1)
+                    
+                    # Create padded image
+                    padded_img = cv2.copyMakeBorder(
+                        cropped_img, 
+                        pad_height, pad_height, pad_width, pad_width,
+                        cv2.BORDER_CONSTANT, 
+                        value=[255, 255, 255]  # White padding
+                    )
+                    
+                    # Use GPT-4o to analyze the cropped vehicle image for license plates
+                    plate_text = analyze_plate_with_gpt4o(padded_img, client)
+                    
+                    if plate_text and plate_text not in ["Could not read plate", "API Error"]:
+                        plate_number = plate_text
+                        break  # Found a readable plate, stop looking
+            
+            # If no vehicle detected with confidence > 50%, analyze the full image
+            if not vehicle_found:
+                print(f"🔍 No vehicle detected with confidence > 50%. Analyzing full image with GPT-4o...")
+                use_full_image = True
+                # Use GPT-4o to analyze the full image
+                plate_text = analyze_plate_with_gpt4o(img, client)
                 if plate_text and plate_text not in ["Could not read plate", "API Error"]:
                     plate_number = plate_text
+                    confidence = 0.3  # Lower confidence for full image analysis
     
-    return plate_number, confidence, cropped_img
+    # If no boxes detected at all, analyze the full image
+    if not results[0].boxes:
+        print(f"🔍 No objects detected by YOLO. Analyzing full image with GPT-4o...")
+        use_full_image = True
+        plate_text = analyze_plate_with_gpt4o(img, client)
+        if plate_text and plate_text not in ["Could not read plate", "API Error"]:
+            plate_number = plate_text
+            confidence = 0.3  # Lower confidence for full image analysis
+    
+    return plate_number, confidence, cropped_img, use_full_image
 
 st.set_page_config(page_title="BIDA-Plate Recognizer", layout="centered")
 
@@ -204,7 +231,7 @@ if camera_input is not None:
     img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
     
     with st.spinner("🤖 AI is analyzing the image..."):
-        plate_text, detection_confidence, cropped_plate = recognize_plate(img_bgr)
+        plate_text, detection_confidence, cropped_vehicle, use_full_image = recognize_plate(img_bgr)
     
     # Create columns for layout
     col1, col2 = st.columns(2)
@@ -214,18 +241,28 @@ if camera_input is not None:
         st.image(image, caption="Captured Image", use_container_width=True)
     
     with col2:
-        if cropped_plate is not None:
-            st.subheader("🎯 Detected Plate")
+        if use_full_image:
+            st.subheader("🔍 Analysis Method")
+            st.info("**Full Image Analysis**\n\nNo vehicle detected with confidence > 50%. GPT-4o analyzed the entire image for license plates.")
+        elif cropped_vehicle is not None:
+            st.subheader("🚗 Detected Vehicle")
             # Convert BGR to RGB for display
-            cropped_rgb = cv2.cvtColor(cropped_plate, cv2.COLOR_BGR2RGB)
-            st.image(cropped_rgb, caption="Cropped License Plate", use_container_width=True)
+            cropped_rgb = cv2.cvtColor(cropped_vehicle, cv2.COLOR_BGR2RGB)
+            st.image(cropped_rgb, caption="Vehicle Containing License Plate", use_container_width=True)
     
     # Results section
     st.markdown("---")
     
     if plate_text != "No plate detected":
         st.success(f"✅ **License Plate Detected**")
-        st.info(f"🎯 **Detection Confidence:** {detection_confidence:.1%}")
+        
+        # Show different confidence information based on analysis method
+        if use_full_image:
+            st.info(f"🔍 **Analysis Method:** Full Image (GPT-4o Vision)")
+            st.info(f"📊 **Detection Status:** Vehicle confidence < 50%, used AI vision")
+        else:
+            st.info(f"🎯 **Vehicle Detection Confidence:** {detection_confidence:.1%}")
+            st.info(f"🔍 **Analysis Method:** Vehicle-focused (YOLO + GPT-4o)")
         
         # Display the plate number prominently
         st.markdown(f"""
@@ -246,6 +283,12 @@ if camera_input is not None:
         
     else:
         st.warning("⚠️ No license plate detected")
+        
+        if use_full_image:
+            st.info("🔍 **Analysis Performed**: Full image analyzed with GPT-4o Vision")
+        else:
+            st.info("🚗 **Analysis Performed**: Vehicle-focused detection")
+            
         st.markdown("""
         **Tips for better detection:**
         - Ensure the plate is clearly visible and well-lit
