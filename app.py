@@ -10,7 +10,7 @@ from PIL import Image
 # Load the YOLOv12 small model for general object detection
 @st.cache_resource
 def load_yolo_model():
-    return YOLO('yolo12s.pt')  # YOLOv12 small model
+    return YOLO('models/yolo12s.pt')  # YOLOv12 small model
 
 model = load_yolo_model()
 
